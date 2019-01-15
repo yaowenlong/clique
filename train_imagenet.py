@@ -32,7 +32,7 @@ parser.add_argument('--epochs', default=20, type=int, metavar='N',
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 
-parser.add_argument('-b', '--batch-size', default=4, type=int,
+parser.add_argument('-b', '--batch-size', default=3, type=int,
                     metavar='N', help='mini-batch size (default: 160)')
 
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
@@ -89,13 +89,19 @@ def main():
     if args.attention:
         print ('attentional transition is used')
     # create model
-    model = cliquenet.build_cliquenet(input_channels=64, list_channels=[40, 80, 160, 160], list_layer_num=[6, 6, 6, 6], if_att=args.attention)
+    model = cliquenet.build_cliquenet(input_channels=64, list_channels=[40, 80, 160, 160], list_layer_num=[6, 6, 6, 6], if_att=args.attention,w=torch.tensor([1.0]).cuda())
+    print("teacher model")
+    print(model)
+    modelstu = cliquenet.build_cliquenet(input_channels=64, list_channels=[40, 80, 160, 160], list_layer_num=[3, 3, 3, 3], if_att=False,w=torch.tensor([1.0]).cuda())
+    print("stu model")
+    print(modelstu)
     # model = cliquenet()
     # model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizerstu = torch.optim.SGD(modelstu.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
    # # optionally resume from a checkpoint
     if args.resume:
@@ -121,16 +127,16 @@ def main():
 
     train_loader = torch.utils.data.DataLoader(
        datasetTrain,
-        batch_size=4, shuffle=True,
+        batch_size=1, shuffle=True,
         num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
         datasetTest,
-        batch_size=4, shuffle=False,
+        batch_size=1, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        validate(val_loader, model,modelstu, criterion)
         return
 
     # get_number_of_param(model)
@@ -139,10 +145,10 @@ def main():
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, modelstu,criterion, optimizer,optimizerstu, epoch)
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        prec1 = validate(val_loader, model,modelstu, criterion)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -168,17 +174,22 @@ def get_number_of_param(model):
     print('total number of the model is %d'%count)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model,modelstu, criterion, optimizer,optimizerstu, epoch):
     """train model"""
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    
+    losses = AverageMeter()
+    lossesstu = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    top1stu = AverageMeter()
+    top5stu = AverageMeter()
 
     # switch to train mode
     model.train()
-
+    modelstu.train()
     end = time.time()
 
     # last_datetime = datetime.datetime.now()
@@ -194,24 +205,35 @@ def train(train_loader, model, criterion, optimizer, epoch):
         model = model.cuda()
         
         # compute output
-        output = model(input_var)
-        print("shuchu:")
-        print(output.shape)
-        print('\n')
-        print("label:")
-        print(target_var.shape)
-        loss = criterion(output, target_var.squeeze())
-
+        print("teacher")
+        output,w = model(input_var)
+        modelstu.w = w
+        modelstu = modelstu.cuda()
+        print("stu")
+        outputstu,wstu = modelstu(input_var)
+        a = target_var[0][0]
+        
+        a = torch.tensor([a]).cuda()
+        loss = criterion(output,a)
+        lossstu = criterion(outputstu,a)
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target_var, topk=(1, 5))
+        prec1, prec5 = accuracy(output.data, a, topk=(1, 5))
+        prec1stu, prec5stu = accuracy(outputstu.data, a, topk=(1, 5))
         losses.update(loss.data.item(), input.size(0))
+        losses.update(lossstu.data.item(), input.size(0))
         top1.update(prec1[0], input.size(0))
         top5.update(prec5[0], input.size(0))
+        top1stu.update(prec1stu[0], input.size(0))
+        top5stu.update(prec5stu[0], input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+
+        optimizerstu.zero_grad()
+        loss.backward(retain_variables=True)
+        lossstu.backward(retain_variables=True)
         optimizer.step()
+        optimizerstu.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -223,23 +245,29 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'
+                  'Lossstu {lossstu.val:.4f} ({lossstu.avg:.4f})\t'
+                  'Prec@1stu {top1stu.val:.3f} ({top1stu.avg:.3f})\t'
+                  'Prec@5stu {top5stu.val:.3f} ({top5stu.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+                   data_time=data_time, loss=losses, top1=top1, top5=top5,lossesstu=lossesstu,top1stu=top1stu,top5stu=top5stu))
 
     print (time.ctime())
 
 
-def validate(val_loader, model, criterion):
+def validate(val_loader, model,modelstu, criterion):
     """validate model"""
     batch_time = AverageMeter()
     losses = AverageMeter()
+    lossesstu = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    top1stu = AverageMeter()
+    top5stu = AverageMeter()
 
     # switch to evaluate mode
     model.eval()
-
+    modelstu.eval()
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
         
@@ -247,15 +275,26 @@ def validate(val_loader, model, criterion):
         input_var = input.cuda()
         target_var = target.cuda()
         model = model.cuda()
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        modelstu.if_att = True
+        modelstu = modelstu.cuda()
 
+        # compute output
+        print("teacher")
+        output,w = model(input_var)
+        print("stu")
+        outputstu,wstu = modelstu(input_var)
+        a = torch.tensor([a]).cuda()
+        loss = criterion(output,a)
+        lossstu = criterion(outputstu,a)
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        prec1, prec5 = accuracy(output.data, a, topk=(1, 5))
+        prec1stu, prec5stu = accuracy(outputstu.data, a, topk=(1, 5))
         losses.update(loss.data[0], input.size(0))
+        lossesstu.update(lossstu.data[0], input.size(0))
         top1.update(prec1[0], input.size(0))
         top5.update(prec5[0], input.size(0))
+        top1stu.update(prec1stu[0], input.size(0))
+        top5stu.update(prec5stu[0], input.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -266,12 +305,15 @@ def validate(val_loader, model, criterion):
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'
+                  'Lossstu {lossstu.val:.4f} ({lossstu.avg:.4f})\t'
+                  'Prec@1 {top1stu.val:.3f} ({top1stu.avg:.3f})\t'
+                  'Prec@5 {top5stu.val:.3f} ({top5stu.avg:.3f})'.format(
                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5))
+                   top1=top1, top5=top5,lossesstu=lossesstu,top1stu = top1stu,top5stu=top5stu))
 
     print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+          .format(top1=top1stu, top5=top5))
 
     return top1.avg
 
